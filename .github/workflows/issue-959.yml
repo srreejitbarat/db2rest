@@ -1,0 +1,61 @@
+name: Issue 959 array resource verification
+on:
+  push:
+    branches: [validation/issue-959]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Reproduce upstream PostgreSQL pool leak
+        shell: bash
+        run: |
+          task_source=db2rest-core/rdbms-support/src/main/java/com/homihq/db2rest/jdbc/JdbcOperationService.java
+          task_helper=db2rest-core/rdbms-support/src/main/java/com/homihq/db2rest/jdbc/JdbcArrayValue.java
+          trap 'git restore --source=HEAD -- "$task_source" "$task_helper"' EXIT
+          git fetch --depth=1 origin 9971d5dadc8aa391e0ca5de1fd2c104929150a86
+          git show 9971d5dadc8aa391e0ca5de1fd2c104929150a86:"$task_source" > "$task_source"
+          rm "$task_helper"
+          set +e
+          ./mvnw -B -ntp -pl db2rest-api/api-rest -am -Dtest=PgJdbcArrayResourceTest#repeatedInsertsReturnEveryBorrowedConnection -Dsurefire.failIfNoSpecifiedTests=false test > baseline.log 2>&1
+          task_exit=$?
+          set -e
+          tail -40 baseline.log
+          test "$task_exit" -ne 0
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          p=Path('db2rest-api/api-rest/target/surefire-reports/TEST-com.homihq.db2rest.jdbc.PgJdbcArrayResourceTest.xml')
+          r=ET.parse(p).getroot()
+          assert r.get('tests')=='1' and r.get('failures')=='1' and r.get('errors')=='0', r.attrib
+          f=r.find('testcase/failure')
+          assert 'array insert must return its connection' in f.get('message','')
+          Path('validation-reports').mkdir(exist_ok=True)
+          Path('validation-reports/baseline-postgres.xml').write_bytes(p.read_bytes())
+          print('Expected upstream PostgreSQL connection leak reproduced.')
+          PY
+      - name: Verify fixed array lifecycle and PostgreSQL regressions
+        run: >-
+          ./mvnw -B -ntp -pl db2rest-api/api-rest -am
+          -Dtest=JdbcOperationServiceArrayTest,JdbcCreateServiceTest,PgJdbcArrayResourceTest,PgReadControllerTest,PgCreateControllerTest,PgMultiTenancyTest
+          -Dsurefire.failIfNoSpecifiedTests=false
+          -DargLine="-javaagent:${HOME}/.m2/repository/org/mockito/mockito-core/5.17.0/mockito-core-5.17.0.jar"
+          test
+      - name: Upload verification reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-959-test-results
+          path: |
+            validation-reports/*
+            db2rest-core/rdbms-support/target/surefire-reports/*.txt
+            db2rest-api/api-rest/target/surefire-reports/*.txt
